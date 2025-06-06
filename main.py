@@ -6,6 +6,10 @@ import json
 import asyncio
 import os
 from dotenv import load_dotenv
+from keep_alive import keep_alive
+
+keep_alive()  # Ça lance un petit serveur web qui maintient le bot actif
+
 
 load_dotenv()  # charge les variables d'environnement depuis .env
 
