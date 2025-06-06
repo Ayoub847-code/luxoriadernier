@@ -54,70 +54,82 @@ async def on_ready():
     except Exception as e:
         print(f"Erreur sync commandes: {e}")
 
+@bot.event
+async def on_guild_join(guild):
+    # Vérifier si le salon commandes existe déjà (au cas où)
+    existing_channel = discord.utils.get(guild.text_channels, name="commandes")
+    if existing_channel is None:
+        # Créer le salon commandes
+        await guild.create_text_channel("commandes")
+        print(f"Salon 'commandes' créé dans le serveur {guild.name}")
+        
+
 # --- Vérifier permissions admin simplifié ---
 def is_admin(interaction: Interaction):
     return interaction.user.guild_permissions.administrator
 
 # --- View Boutique avec pagination + boutons Acheter ---
 class BoutiqueView(View):
-    def __init__(self, products, interaction: Interaction):
+    def __init__(self, products):
         super().__init__(timeout=180)
         self.products = list(products.values())
         self.index = 0
-        self.interaction = interaction
         self.update_buttons()
 
     def update_buttons(self):
-        self.clear_items()
-        # Bouton précédent
-        self.add_item(Button(label="⬅️ Précédent", style=ButtonStyle.secondary, disabled=self.index == 0, custom_id="prev"))
-        # Bouton acheter
-        self.add_item(Button(label="🛒 Acheter", style=ButtonStyle.green, custom_id="buy"))
-        # Bouton suivant
-        self.add_item(Button(label="➡️ Suivant", style=ButtonStyle.secondary, disabled=self.index >= len(self.products) -1, custom_id="next"))
+        # Met à jour l'état des boutons en fonction de l'index
+        self.previous.disabled = self.index == 0
+        self.next.disabled = self.index >= len(self.products) - 1
 
     def current_product_embed(self):
         p = self.products[self.index]
-        embed = discord.Embed(title=p["name"], description=p["description"], color=discord.Color.blue())
+        embed = Embed(title=p["name"], description=p["description"], color=discord.Color.blue())
         embed.add_field(name="Prix", value=f"{p['price']} €", inline=True)
-        embed.add_field(name="Stock", value=p["stock"], inline=True)
+        embed.add_field(name="Stock", value=str(p["stock"]), inline=True)
         embed.set_footer(text=f"Produit {self.index + 1} / {len(self.products)}")
         return embed
 
-    @discord.ui.button(label="Précédent", style=ButtonStyle.secondary, custom_id="prev")
+    @discord.ui.button(label="⬅️ Précédent", style=ButtonStyle.secondary)
     async def previous(self, interaction: Interaction, button: Button):
         if self.index > 0:
             self.index -= 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.current_product_embed(), view=self)
 
-    @discord.ui.button(label="Acheter", style=ButtonStyle.green, custom_id="buy")
+    @discord.ui.button(label="🛒 Acheter", style=ButtonStyle.green)
     async def buy(self, interaction: Interaction, button: Button):
-        # Envoyer un message dans le salon commandes
         channel = discord.utils.get(interaction.guild.text_channels, name="commandes")
         if not channel:
             await interaction.response.send_message("Salon `commandes` introuvable.", ephemeral=True)
             return
+
         product = self.products[self.index]
-        # Créer la commande dans la DB
         user_id = str(interaction.user.id)
-        commande_id = str(len(db["commands"]) + 1)
+
+        # Assure que 'commands' existe dans la base
+        if "commands" not in db:
+            db["commands"] = {}
+
+        # Génère un ID unique pour la commande
+        commande_id = str(max(map(int, db["commands"].keys())) + 1) if db["commands"] else "1"
+
         db["commands"][commande_id] = {
             "user": user_id,
             "product": product["name"],
             "status": "En attente"
         }
         save_db(db)
-        # Envoyer message dans commandes
+
         await channel.send(f"Nouvelle commande #{commande_id} de {interaction.user.mention} : **{product['name']}**")
         await interaction.response.send_message(f"Commande pour **{product['name']}** envoyée avec succès !", ephemeral=True)
 
-    @discord.ui.button(label="Suivant", style=ButtonStyle.secondary, custom_id="next")
+    @discord.ui.button(label="➡️ Suivant", style=ButtonStyle.secondary)
     async def next(self, interaction: Interaction, button: Button):
         if self.index < len(self.products) - 1:
             self.index += 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.current_product_embed(), view=self)
+
 
 # --- Commandes slash ---
 
@@ -138,6 +150,8 @@ async def addproduct(interaction: Interaction, name: str, price: float, stock: i
     if not is_admin(interaction):
         await interaction.response.send_message("Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
         return
+    if "products" not in db:
+        db["products"] = {}
     if name in db["products"]:
         await interaction.response.send_message("Ce produit existe déjà.", ephemeral=True)
         return
@@ -150,25 +164,25 @@ async def addproduct(interaction: Interaction, name: str, price: float, stock: i
     save_db(db)
     await interaction.response.send_message(f"Produit **{name}** ajouté à la boutique.", ephemeral=True)
 
-# 3. Supprimer un produit (admin only)
+
 @bot.tree.command(name="deleteproduct", description="Supprimer un produit de la boutique (admin seulement)")
 @app_commands.describe(name="Nom du produit à supprimer")
 async def deleteproduct(interaction: Interaction, name: str):
     if not is_admin(interaction):
         await interaction.response.send_message("Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
         return
-    if name not in db["products"]:
+    if "products" not in db or name not in db["products"]:
         await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
         return
     del db["products"][name]
     save_db(db)
     await interaction.response.send_message(f"Produit **{name}** supprimé de la boutique.", ephemeral=True)
 
-# 4. Service client (IA simulée)
+
 @bot.tree.command(name="serviceclient", description="Pose une question au service client IA")
 @app_commands.describe(question="Ta question")
 async def serviceclient(interaction: Interaction, question: str):
-    # Ici on simule une réponse IA (tu peux intégrer une vraie API IA)
+    # Réponse simulée pour le moment
     reponse = f"Réponse automatique à ta question : {question}\nDésolé, le service IA n'est pas encore implémenté."
     await interaction.response.send_message(reponse, ephemeral=True)
 
@@ -251,24 +265,39 @@ async def cmdlivrer(interaction: Interaction, commande_id: str):
 
 # /suprcmd - supprimer commande (admin)
 @bot.tree.command(name="suprcmd", description="Supprimer une commande (admin)")
-@app_commands.describe(commande_id="ID de la commande")
-async def suprcmd(interaction: Interaction, commande_id: str):
+@app_commands.describe(username="Nom d'utilisateur (pseudo)", product="Nom du produit commandé")
+async def suprcmd(interaction: Interaction, username: str, product: str):
     if not is_admin(interaction):
         await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
         return
-    if commande_id not in db["commands"]:
-        await interaction.response.send_message("Commande non trouvée.", ephemeral=True)
+
+    if "commands" not in db or not db["commands"]:
+        await interaction.response.send_message("Aucune commande trouvée.", ephemeral=True)
         return
-    del db["commands"][commande_id]
+
+    # Recherche de la commande correspondant au pseudo + produit
+    to_delete = None
+    for cid, cmd in db["commands"].items():
+        user_obj = interaction.guild.get_member(int(cmd["user"]))  # récupère membre par id
+        if user_obj and user_obj.name == username and cmd["product"].lower() == product.lower():
+            to_delete = cid
+            break
+
+    if not to_delete:
+        await interaction.response.send_message("Commande non trouvée pour cet utilisateur et produit.", ephemeral=True)
+        return
+
+    del db["commands"][to_delete]
     save_db(db)
-    await interaction.response.send_message(f"Commande #{commande_id} supprimée.", ephemeral=True)
+    await interaction.response.send_message(f"Commande de {username} pour **{product}** supprimée.", ephemeral=True)
+
 
 # /annulercmd - supprimer sa propre commande
 @bot.tree.command(name="annulercmd", description="Annuler ta commande")
 @app_commands.describe(commande_id="ID de ta commande")
 async def annulercmd(interaction: Interaction, commande_id: str):
     user_id = str(interaction.user.id)
-    if commande_id not in db["commands"]:
+    if "commands" not in db or commande_id not in db["commands"]:
         await interaction.response.send_message("Commande non trouvée.", ephemeral=True)
         return
     if db["commands"][commande_id]["user"] != user_id:
@@ -285,10 +314,12 @@ async def addcmd(interaction: Interaction, user: discord.User, product: str):
     if not is_admin(interaction):
         await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
         return
-    if product not in db["products"]:
+    if "products" not in db or product not in db["products"]:
         await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
         return
-    commande_id = str(len(db["commands"]) + 1)
+    if "commands" not in db:
+        db["commands"] = {}
+    commande_id = str(max(map(int, db["commands"].keys())) + 1) if db["commands"] else "1"
     db["commands"][commande_id] = {
         "user": str(user.id),
         "product": product,
