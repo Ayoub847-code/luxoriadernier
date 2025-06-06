@@ -5,6 +5,9 @@ import os
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from keep_alive import keep_alive  # ton fichier avec le serveur Flask
+
+keep_alive()
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
