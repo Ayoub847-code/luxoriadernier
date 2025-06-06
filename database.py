@@ -1,43 +1,100 @@
 import json
-import os
 
-class Database:
-    def __init__(self):
-        self.path = "database.json"
-        if not os.path.exists(self.path):
-            with open(self.path, "w") as f:
-                json.dump({"products": [], "packs": []}, f)
+DATABASE_FILE = "database.json"
 
-    def load(self):
-        with open(self.path, "r") as f:
-            return json.load(f)
+# Chargement de la base de données
+def load_db():
+    with open(DATABASE_FILE, "r") as f:
+        return json.load(f)
 
-    def save(self, data):
-        with open(self.path, "w") as f:
-            json.dump(data, f, indent=4)
+# Sauvegarde de la base de données
+def save_db(db):
+    with open(DATABASE_FILE, "w") as f:
+        json.dump(db, f, indent=4)
 
-    def add_product(self, product):
-        data = self.load()
-        data["products"].append(product)
-        self.save(data)
+# Ajouter une commande
+def add_command(user_id, product_name):
+    db = load_db()
+    db["commands"].append({
+        "user": user_id,
+        "product": product_name,
+        "status": "en attente"
+    })
+    save_db(db)
 
-    def remove_product(self, name):
-        data = self.load()
-        data["products"] = [p for p in data["products"] if p["name"].lower() != name.lower()]
-        self.save(data)
+# Obtenir les commandes d'un utilisateur
+def get_user_commands(user_id):
+    db = load_db()
+    return [cmd for cmd in db["commands"] if cmd["user"] == user_id]
 
-    def get_products(self):
-        return self.load()["products"]
+# Obtenir toutes les commandes en cours
+def get_pending_commands():
+    db = load_db()
+    return [cmd for cmd in db["commands"] if cmd["status"] != "livrée"]
 
-    def add_pack(self, pack):
-        data = self.load()
-        data["packs"].append(pack)
-        self.save(data)
+# Marquer une commande comme livrée
+def mark_command_delivered(user_id, product_name):
+    db = load_db()
+    for cmd in db["commands"]:
+        if cmd["user"] == user_id and cmd["product"].lower() == product_name.lower():
+            cmd["status"] = "livrée"
+    save_db(db)
 
-    def remove_pack(self, name):
-        data = self.load()
-        data["packs"] = [p for p in data["packs"] if p["name"].lower() != name.lower()]
-        self.save(data)
+# Supprimer une commande (admin)
+def delete_command(user_id, product_name):
+    db = load_db()
+    db["commands"] = [cmd for cmd in db["commands"] if not (cmd["user"] == user_id and cmd["product"].lower() == product_name.lower())]
+    save_db(db)
 
-    def get_packs(self):
-        return self.load()["packs"]
+# Supprimer sa propre commande
+def delete_own_command(user_id):
+    db = load_db()
+    db["commands"] = [cmd for cmd in db["commands"] if cmd["user"] != user_id]
+    save_db(db)
+
+# Ajouter un produit
+def add_product(name, description, stock, price):
+    db = load_db()
+    db["products"].append({
+        "name": name,
+        "description": description,
+        "stock": stock,
+        "price": price
+    })
+    save_db(db)
+
+# Supprimer un produit
+def delete_product(name):
+    db = load_db()
+    db["products"] = [p for p in db["products"] if p["name"].lower() != name.lower()]
+    save_db(db)
+
+# Ajouter un pack
+def add_pack(name, description, price):
+    db = load_db()
+    db["packs"].append({
+        "name": name,
+        "description": description,
+        "price": price
+    })
+    save_db(db)
+
+# Supprimer un pack
+def delete_pack(name):
+    db = load_db()
+    db["packs"] = [p for p in db["packs"] if p["name"].lower() != name.lower()]
+    save_db(db)
+
+# Ajouter un abonnement
+def add_subscription(user_id, sub_type, duration):
+    db = load_db()
+    db["subscriptions"][str(user_id)] = {
+        "type": sub_type,
+        "duration": duration
+    }
+    save_db(db)
+
+# Obtenir un abonnement
+def get_subscription(user_id):
+    db = load_db()
+    return db["subscriptions"].get(str(user_id), None)
