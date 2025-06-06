@@ -1,6 +1,8 @@
 {
-  "commands": [],
-  "products": [],
-  "packs": [],
-  "subscriptions": {}
+  "products": {},
+  "orders": {},
+  "packs": {},
+  "subscriptions": {},
+  "users": {},
+  "logs": []
 }
