@@ -1,364 +1,415 @@
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-import os
+from discord.ext import commands
+from discord import app_commands, Interaction, ButtonStyle
+from discord.ui import View, Button
+import json
 import asyncio
+import os
 from dotenv import load_dotenv
-import database  # ton fichier database.py
 
-load_dotenv()
+load_dotenv()  # charge les variables d'environnement depuis .env
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
-TREE = bot.tree
 
-# ----- Salon commandes (sera créé si inexistant) -----
-commandes_channel_name = "commandes"
-commandes_channel = None
+# --- Chargement / sauvegarde de la base de données (produits, commandes, packs, abonnements, logs) ---
+DB_FILE = "database.json"
 
+def load_db():
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "products": {},
+            "commands": {},
+            "packs": {},
+            "subscriptions": {},
+            "logs": []
+        }
+
+def save_db(db):
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=4)
+
+db = load_db()
+
+# --- Salon commandes automatique création au démarrage ---
 @bot.event
 async def on_ready():
-    global commandes_channel
-    guild = bot.guilds[0] if bot.guilds else None
-    if guild is None:
-        print("Le bot n'est dans aucun serveur.")
-        return
+    print(f"Bot connecté en tant que {bot.user}")
+    for guild in bot.guilds:
+        existing_channel = discord.utils.get(guild.text_channels, name="commandes")
+        if not existing_channel:
+            await guild.create_text_channel("commandes")
+    try:
+        synced = await bot.tree.sync()
+        print(f"Commandes slash synchronisées ({len(synced)})")
+    except Exception as e:
+        print(f"Erreur sync commandes: {e}")
 
-    # Cherche le channel commandes
-    commandes_channel = discord.utils.get(guild.text_channels, name=commandes_channel_name)
-    if commandes_channel is None:
-        # Création du channel commandes
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False)
+# --- Vérifier permissions admin simplifié ---
+def is_admin(interaction: Interaction):
+    return interaction.user.guild_permissions.administrator
+
+# --- View Boutique avec pagination + boutons Acheter ---
+class BoutiqueView(View):
+    def __init__(self, products, interaction: Interaction):
+        super().__init__(timeout=180)
+        self.products = list(products.values())
+        self.index = 0
+        self.interaction = interaction
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        # Bouton précédent
+        self.add_item(Button(label="⬅️ Précédent", style=ButtonStyle.secondary, disabled=self.index == 0, custom_id="prev"))
+        # Bouton acheter
+        self.add_item(Button(label="🛒 Acheter", style=ButtonStyle.green, custom_id="buy"))
+        # Bouton suivant
+        self.add_item(Button(label="➡️ Suivant", style=ButtonStyle.secondary, disabled=self.index >= len(self.products) -1, custom_id="next"))
+
+    def current_product_embed(self):
+        p = self.products[self.index]
+        embed = discord.Embed(title=p["name"], description=p["description"], color=discord.Color.blue())
+        embed.add_field(name="Prix", value=f"{p['price']} €", inline=True)
+        embed.add_field(name="Stock", value=p["stock"], inline=True)
+        embed.set_footer(text=f"Produit {self.index + 1} / {len(self.products)}")
+        return embed
+
+    @discord.ui.button(label="Précédent", style=ButtonStyle.secondary, custom_id="prev")
+    async def previous(self, interaction: Interaction, button: Button):
+        if self.index > 0:
+            self.index -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.current_product_embed(), view=self)
+
+    @discord.ui.button(label="Acheter", style=ButtonStyle.green, custom_id="buy")
+    async def buy(self, interaction: Interaction, button: Button):
+        # Envoyer un message dans le salon commandes
+        channel = discord.utils.get(interaction.guild.text_channels, name="commandes")
+        if not channel:
+            await interaction.response.send_message("Salon `commandes` introuvable.", ephemeral=True)
+            return
+        product = self.products[self.index]
+        # Créer la commande dans la DB
+        user_id = str(interaction.user.id)
+        commande_id = str(len(db["commands"]) + 1)
+        db["commands"][commande_id] = {
+            "user": user_id,
+            "product": product["name"],
+            "status": "En attente"
         }
-        commandes_channel = await guild.create_text_channel(commandes_channel_name, overwrites=overwrites)
-        print(f"Salon #{commandes_channel_name} créé.")
-    else:
-        print(f"Salon #{commandes_channel_name} trouvé.")
+        save_db(db)
+        # Envoyer message dans commandes
+        await channel.send(f"Nouvelle commande #{commande_id} de {interaction.user.mention} : **{product['name']}**")
+        await interaction.response.send_message(f"Commande pour **{product['name']}** envoyée avec succès !", ephemeral=True)
 
-    await TREE.sync()
-    print(f"{bot.user} est connecté !")
+    @discord.ui.button(label="Suivant", style=ButtonStyle.secondary, custom_id="next")
+    async def next(self, interaction: Interaction, button: Button):
+        if self.index < len(self.products) - 1:
+            self.index += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.current_product_embed(), view=self)
 
-# ------------------ COMMANDES -------------------
+# --- Commandes slash ---
 
-# --- Commandes de gestion des commandes ---
-
-@TREE.command(name="cadis", description="Voir les produits que vous avez commandés")
-async def cadis(interaction: discord.Interaction):
-    cmds = database.get_commands_by_user(interaction.user.id)
-    if not cmds:
-        await interaction.response.send_message("Aucune commande trouvée.", ephemeral=True)
+# 1. Boutique
+@bot.tree.command(name="boutique", description="Afficher la boutique avec les produits")
+async def boutique(interaction: Interaction):
+    if not db["products"]:
+        await interaction.response.send_message("La boutique est vide.", ephemeral=True)
         return
-    embed = discord.Embed(title="🛒 Vos commandes", color=0x00ffcc)
-    for cmd in cmds:
-        embed.add_field(name=cmd["product"], value=f"Statut : {cmd['status']}", inline=False)
+    view = BoutiqueView(db["products"], interaction)
+    embed = view.current_product_embed()
+    await interaction.response.send_message(embed=embed, view=view)
+
+# 2. Ajouter un produit (admin only)
+@bot.tree.command(name="addproduct", description="Ajouter un produit à la boutique (admin seulement)")
+@app_commands.describe(name="Nom du produit", price="Prix en €", stock="Quantité en stock", description="Description du produit")
+async def addproduct(interaction: Interaction, name: str, price: float, stock: int, description: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+        return
+    if name in db["products"]:
+        await interaction.response.send_message("Ce produit existe déjà.", ephemeral=True)
+        return
+    db["products"][name] = {
+        "name": name,
+        "price": price,
+        "stock": stock,
+        "description": description
+    }
+    save_db(db)
+    await interaction.response.send_message(f"Produit **{name}** ajouté à la boutique.", ephemeral=True)
+
+# 3. Supprimer un produit (admin only)
+@bot.tree.command(name="deleteproduct", description="Supprimer un produit de la boutique (admin seulement)")
+@app_commands.describe(name="Nom du produit à supprimer")
+async def deleteproduct(interaction: Interaction, name: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+        return
+    if name not in db["products"]:
+        await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
+        return
+    del db["products"][name]
+    save_db(db)
+    await interaction.response.send_message(f"Produit **{name}** supprimé de la boutique.", ephemeral=True)
+
+# 4. Service client (IA simulée)
+@bot.tree.command(name="serviceclient", description="Pose une question au service client IA")
+@app_commands.describe(question="Ta question")
+async def serviceclient(interaction: Interaction, question: str):
+    # Ici on simule une réponse IA (tu peux intégrer une vraie API IA)
+    reponse = f"Réponse automatique à ta question : {question}\nDésolé, le service IA n'est pas encore implémenté."
+    await interaction.response.send_message(reponse, ephemeral=True)
+
+
+# --------- Autres commandes à rajouter ici -----------
+
+# Exemple modération: /ban
+@bot.tree.command(name="ban", description="Bannir un membre")
+@app_commands.describe(user="Utilisateur à bannir", raison="Raison du ban")
+async def ban(interaction: Interaction, user: discord.Member, raison: str = "Aucune raison spécifiée"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    try:
+        await user.ban(reason=raison)
+        await interaction.response.send_message(f"{user} a été banni pour : {raison}")
+    except Exception as e:
+        await interaction.response.send_message(f"Erreur lors du ban : {e}", ephemeral=True)
+
+# /kick
+@bot.tree.command(name="kick", description="Expulser un membre")
+@app_commands.describe(user="Utilisateur à expulser", raison="Raison de l'expulsion")
+async def kick(interaction: Interaction, user: discord.Member, raison: str = "Aucune raison spécifiée"):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    try:
+        await user.kick(reason=raison)
+        await interaction.response.send_message(f"{user} a été expulsé pour : {raison}")
+    except Exception as e:
+        await interaction.response.send_message(f"Erreur lors de l'expulsion : {e}", ephemeral=True)
+
+# /clear
+@bot.tree.command(name="clear", description="Supprimer des messages")
+@app_commands.describe(amount="Nombre de messages à supprimer")
+async def clear(interaction: Interaction, amount: int):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.response.send_message(f"{len(deleted)} messages supprimés.", ephemeral=True)
+
+# /cadis - voir ses commandes
+@bot.tree.command(name="cadis", description="Voir tes commandes")
+async def cadis(interaction: Interaction):
+    user_id = str(interaction.user.id)
+    user_cmds = [cmd for cmd in db["commands"].values() if cmd["user"] == user_id]
+    if not user_cmds:
+        await interaction.response.send_message("Tu n'as aucune commande.", ephemeral=True)
+        return
+    desc = "\n".join(f"- {c['product']} : {c['status']}" for c in user_cmds)
+    embed = discord.Embed(title="Tes commandes", description=desc, color=discord.Color.green())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@TREE.command(name="cmdencours", description="Voir les commandes en cours")
-@app_commands.checks.has_permissions(administrator=True)
-async def cmdencours(interaction: discord.Interaction):
-    cmds = database.get_commands_not_livree()
+# /cmdencours (admin voir commandes en cours)
+@bot.tree.command(name="cmdencours", description="Voir commandes en cours (admin)")
+async def cmdencours(interaction: Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    cmds = [f"#{cid} : {c['product']} ({c['status']})" for cid,c in db["commands"].items() if c["status"] == "En attente"]
     if not cmds:
         await interaction.response.send_message("Aucune commande en cours.", ephemeral=True)
         return
-    embed = discord.Embed(title="📦 Commandes en cours", color=0xffcc00)
-    for cmd in cmds:
-        embed.add_field(name=cmd["product"], value=f"Par <@{cmd['user']}> - Statut : {cmd['status']}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message("\n".join(cmds), ephemeral=True)
 
-@TREE.command(name="cmdlivrer", description="Marquer une commande comme livrée")
-@app_commands.checks.has_permissions(administrator=True)
-async def cmdlivrer(interaction: discord.Interaction, user: discord.Member, produit: str):
-    ok = database.update_command_status(user.id, produit, "livrée")
-    if ok:
-        await interaction.response.send_message("Commande livrée.")
-    else:
-        await interaction.response.send_message("Commande introuvable.")
+# /cmdlivrer - enlever commande livrée
+@bot.tree.command(name="cmdlivrer", description="Marquer une commande comme livrée (admin)")
+@app_commands.describe(commande_id="ID de la commande livrée")
+async def cmdlivrer(interaction: Interaction, commande_id: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    if commande_id not in db["commands"]:
+        await interaction.response.send_message("Commande non trouvée.", ephemeral=True)
+        return
+    db["commands"][commande_id]["status"] = "Livrée"
+    save_db(db)
+    await interaction.response.send_message(f"Commande #{commande_id} marquée comme livrée.", ephemeral=True)
 
-@TREE.command(name="suprcmd", description="Supprimer une commande")
-@app_commands.checks.has_permissions(administrator=True)
-async def suprcmd(interaction: discord.Interaction, user: discord.Member, produit: str):
-    database.remove_command(user.id, produit)
-    await interaction.response.send_message("Commande supprimée.")
+# /suprcmd - supprimer commande (admin)
+@bot.tree.command(name="suprcmd", description="Supprimer une commande (admin)")
+@app_commands.describe(commande_id="ID de la commande")
+async def suprcmd(interaction: Interaction, commande_id: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    if commande_id not in db["commands"]:
+        await interaction.response.send_message("Commande non trouvée.", ephemeral=True)
+        return
+    del db["commands"][commande_id]
+    save_db(db)
+    await interaction.response.send_message(f"Commande #{commande_id} supprimée.", ephemeral=True)
 
-@TREE.command(name="annulercmd", description="Annuler votre commande")
-async def annulercmd(interaction: discord.Interaction, produit: str):
-    database.remove_command(interaction.user.id, produit)
-    await interaction.response.send_message("Commande annulée.", ephemeral=True)
+# /annulercmd - supprimer sa propre commande
+@bot.tree.command(name="annulercmd", description="Annuler ta commande")
+@app_commands.describe(commande_id="ID de ta commande")
+async def annulercmd(interaction: Interaction, commande_id: str):
+    user_id = str(interaction.user.id)
+    if commande_id not in db["commands"]:
+        await interaction.response.send_message("Commande non trouvée.", ephemeral=True)
+        return
+    if db["commands"][commande_id]["user"] != user_id:
+        await interaction.response.send_message("Ce n'est pas ta commande.", ephemeral=True)
+        return
+    del db["commands"][commande_id]
+    save_db(db)
+    await interaction.response.send_message(f"Commande #{commande_id} annulée.", ephemeral=True)
 
-@TREE.command(name="addcmd", description="Ajouter une commande (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def addcmd(interaction: discord.Interaction, user: discord.Member, produit: str):
-    database.add_command(user.id, produit)
-    await interaction.response.send_message("Commande ajoutée manuellement.")
+# /addcmd - ajouter commande manuellement (admin)
+@bot.tree.command(name="addcmd", description="Ajouter une commande manuellement (admin)")
+@app_commands.describe(user="Utilisateur", product="Produit")
+async def addcmd(interaction: Interaction, user: discord.User, product: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
+        return
+    if product not in db["products"]:
+        await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
+        return
+    commande_id = str(len(db["commands"]) + 1)
+    db["commands"][commande_id] = {
+        "user": str(user.id),
+        "product": product,
+        "status": "En attente"
+    }
+    save_db(db)
+    await interaction.response.send_message(f"Commande manuelle #{commande_id} ajoutée pour {user.mention}.", ephemeral=True)
 
-# --- Commandes produits ---
+# /prix <produit>
+@bot.tree.command(name="prix", description="Afficher le prix d'un produit")
+@app_commands.describe(name="Nom du produit")
+async def prix(interaction: Interaction, name: str):
+    if name not in db["products"]:
+        await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
+        return
+    p = db["products"][name]
+    await interaction.response.send_message(f"Prix de **{name}** : {p['price']} €", ephemeral=True)
 
-@TREE.command(name="prix", description="Voir le prix d’un produit")
-async def prix(interaction: discord.Interaction, produit: str):
-    p = database.get_product(produit)
-    if p:
-        await interaction.response.send_message(f"Le prix de **{produit}** est **{p['price']} €**.\nStock : {p['stock']}", ephemeral=True)
-    else:
-        await interaction.response.send_message("Produit introuvable.", ephemeral=True)
-
-@TREE.command(name="pack", description="Afficher les packs disponibles")
-async def pack(interaction: discord.Interaction):
-    packs = database.get_all_packs()
-    if not packs:
+# /pack - montrer les packs en vente
+@bot.tree.command(name="pack", description="Afficher les packs en vente")
+async def pack(interaction: Interaction):
+    if not db["packs"]:
         await interaction.response.send_message("Aucun pack disponible.", ephemeral=True)
         return
-    embed = discord.Embed(title="🎁 Packs disponibles", color=0x33cc33)
-    for p in packs:
-        embed.add_field(name=p["name"], value=f"{p['price']}€ - {p['description']}", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    desc = "\n".join(f"- {name}: {info['description']} - {info['price']} €" for name, info in db["packs"].items())
+    embed = discord.Embed(title="Packs en vente", description=desc, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
 
-@TREE.command(name="addpacks", description="Ajouter un pack (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def addpacks(interaction: discord.Interaction, name: str, price: float, description: str):
-    db = database.load_db()
-    db["packs"].append({ "name": name, "price": price, "description": description })
-    database.save_db(db)
-    await interaction.response.send_message("Pack ajouté.")
-
-@TREE.command(name="suprpack", description="Supprimer un pack (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def suprpack(interaction: discord.Interaction, name: str):
-    ok = database.remove_pack(name)
-    if ok:
-        await interaction.response.send_message("Pack supprimé.")
-    else:
-        await interaction.response.send_message("Pack introuvable.")
-
-# --- Commandes VIP / Abonnements ---
-
-@TREE.command(name="abonnement", description="Voir ton abonnement")
-async def abonnement(interaction: discord.Interaction):
-    db = database.load_db()
-    abo = db["subscriptions"].get(str(interaction.user.id))
-    if not abo:
-        await interaction.response.send_message("Aucun abonnement actif.", ephemeral=True)
+# /addpacks - ajouter un pack (admin)
+@bot.tree.command(name="addpacks", description="Ajouter un pack (admin)")
+@app_commands.describe(name="Nom du pack", price="Prix en €", description="Description du pack")
+async def addpacks(interaction: Interaction, name: str, price: float, description: str):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
         return
-    await interaction.response.send_message(f"Type : {abo['type']}\nExpire le : {abo['end']}", ephemeral=True)
-
-@TREE.command(name="ajouterabo", description="Ajouter un abonnement à un utilisateur")
-@app_commands.checks.has_permissions(administrator=True)
-async def ajouterabo(interaction: discord.Interaction, user: discord.Member, type: str, duree_jours: int):
-    from datetime import datetime, timedelta
-    fin = (datetime.utcnow() + timedelta(days=duree_jours)).strftime("%Y-%m-%d")
-    db = database.load_db()
-    db["subscriptions"][str(user.id)] = {"type": type, "end": fin}
-    database.save_db(db)
-    await interaction.response.send_message("Abonnement ajouté.")
-
-@TREE.command(name="monprofil", description="Afficher ton profil Luxoria")
-async def monprofil(interaction: discord.Interaction):
-    db = database.load_db()
-    abo = db["subscriptions"].get(str(interaction.user.id), {"type": "Aucun", "end": "-"})
-    cmds = database.get_commands_by_user(interaction.user.id)
-    embed = discord.Embed(title=f"Profil de {interaction.user.name}", color=0x7289da)
-    embed.add_field(name="Abonnement", value=abo["type"])
-    embed.add_field(name="Expire le", value=abo["end"])
-    embed.add_field(name="Commandes passées", value=str(len(cmds)))
-    embed.set_footer(text=f"Membre depuis {interaction.user.joined_at.date()}.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@TREE.command(name="vip", description="Voir les avantages VIP")
-async def vip(interaction: discord.Interaction):
-    embed = discord.Embed(title="⭐ Avantages VIP", description="Accès prioritaire, promos exclusives, support rapide...", color=0xffd700)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@TREE.command(name="vip-promos", description="Promos réservées aux VIP")
-async def vip_promos(interaction: discord.Interaction):
-    await interaction.response.send_message("Actuellement aucune promo VIP disponible.", ephemeral=True)
-
-@TREE.command(name="vip-support", description="Ouvrir un ticket prioritaire pour VIP")
-async def vip_support(interaction: discord.Interaction):
-    overwrites = {
-        interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    db["packs"][name] = {
+        "price": price,
+        "description": description
     }
-    channel = await interaction.guild.create_text_channel(name=f"vip-{interaction.user.name}", overwrites=overwrites)
-    await channel.send(f"Support prioritaire pour <@{interaction.user.id}>.")
-    await interaction.response.send_message("Ticket prioritaire créé.", ephemeral=True)
+    save_db(db)
+    await interaction.response.send_message(f"Pack **{name}** ajouté.", ephemeral=True)
 
-# --- Logs, Clear, Ban, Kick ---
-
-@TREE.command(name="logs", description="Afficher les dernières commandes")
-async def logs(interaction: discord.Interaction):
-    logs = database.get_all_commands()[-5:]
-    if not logs:
-        await interaction.response.send_message("Aucune commande enregistrée.", ephemeral=True)
+# /acheter <produit> - crée ticket d'achat
+@bot.tree.command(name="acheter", description="Acheter un produit")
+@app_commands.describe(name="Nom du produit")
+async def acheter(interaction: Interaction, name: str):
+    if name not in db["products"]:
+        await interaction.response.send_message("Produit non trouvé.", ephemeral=True)
         return
-    embed = discord.Embed(title="Logs des dernières commandes", color=0x666666)
-    for l in logs:
-        embed.add_field(name=l["product"], value=f"<@{l['user']}> - {l['status']}", inline=False)
+    product = db["products"][name]
+    channel = discord.utils.get(interaction.guild.text_channels, name="commandes")
+    if not channel:
+        await interaction.response.send_message("Salon `commandes` introuvable.", ephemeral=True)
+        return
+    commande_id = str(len(db["commands"]) + 1)
+    db["commands"][commande_id] = {
+        "user": str(interaction.user.id),
+        "product": name,
+        "status": "En attente"
+    }
+    save_db(db)
+    await channel.send(f"Nouvelle commande #{commande_id} de {interaction.user.mention} : **{name}**")
+    await interaction.response.send_message(f"Commande pour **{name}** enregistrée.", ephemeral=True)
+
+# /suivi - montre état commande
+@bot.tree.command(name="suivi", description="Voir l'état de ta commande")
+async def suivi(interaction: Interaction):
+    user_id = str(interaction.user.id)
+    user_cmds = [c for c in db["commands"].values() if c["user"] == user_id]
+    if not user_cmds:
+        await interaction.response.send_message("Tu n'as aucune commande en cours.", ephemeral=True)
+        return
+    desc = "\n".join(f"- {c['product']} : {c['status']}" for c in user_cmds)
+    await interaction.response.send_message(f"Voici tes commandes :\n{desc}", ephemeral=True)
+
+# /abonnement - infos abonnement
+@bot.tree.command(name="abonnement", description="Afficher infos abonnement")
+async def abonnement(interaction: Interaction):
+    user_id = str(interaction.user.id)
+    sub = db["subscriptions"].get(user_id)
+    if not sub:
+        await interaction.response.send_message("Tu n'as pas d'abonnement actif.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Ton abonnement", color=discord.Color.purple())
+    embed.add_field(name="Type", value=sub["type"])
+    embed.add_field(name="Durée", value=sub["duration"])
+    embed.add_field(name="Fin", value=sub["end_date"])
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@TREE.command(name="clear", description="Supprimer des messages")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def clear(interaction: discord.Interaction, amount: int):
-    await interaction.channel.purge(limit=amount)
-    await interaction.response.send_message(f"{amount} messages supprimés.", ephemeral=True)
+# /monprofil - affichage profil utilisateur
+@bot.tree.command(name="monprofil", description="Afficher ton profil VIP et commandes")
+async def monprofil(interaction: Interaction):
+    user_id = str(interaction.user.id)
+    # Exemple simple
+    embed = discord.Embed(title=f"Profil de {interaction.user.name}", color=discord.Color.teal())
+    embed.add_field(name="Rôles VIP", value="VIP, Nitro (exemple)", inline=False)
+    cmds = [c for c in db["commands"].values() if c["user"] == user_id]
+    embed.add_field(name="Nombre de commandes", value=str(len(cmds)))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@TREE.command(name="ban", description="Bannir un membre")
-@app_commands.checks.has_permissions(ban_members=True)
-async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "Pas de raison"):
-    await user.ban(reason=reason)
-    await interaction.response.send_message(f"{user.mention} banni.")
+# /vip - infos VIP
+@bot.tree.command(name="vip", description="Informations VIP")
+async def vip(interaction: Interaction):
+    embed = discord.Embed(title="Informations VIP", description="Avantages VIP et offres", color=discord.Color.gold())
+    embed.add_field(name="Support dédié", value="Oui")
+    embed.add_field(name="Accès exclusif", value="Oui")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@TREE.command(name="kick", description="Expulser un membre")
-@app_commands.checks.has_permissions(kick_members=True)
-async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "Pas de raison"):
-    await user.kick(reason=reason)
-    await interaction.response.send_message(f"{user.mention} expulsé.")
-
-# --- Boutique paginée avec boutons ---
-
-class BoutiqueView(discord.ui.View):
-    def __init__(self, produits):
-        super().__init__(timeout=120)
-        self.produits = produits
-        self.index = 0
-        self.message = None
-
-    async def update_message(self):
-        produit = self.produits[self.index]
-        embed = discord.Embed(title=f"🛍️ Boutique - {produit['name']}", color=0x3498db)
-        embed.add_field(name="Description", value=produit["description"], inline=False)
-        embed.add_field(name="Prix", value=f"{produit['price']} €", inline=True)
-        embed.add_field(name="Stock", value=str(produit["stock"]), inline=True)
-        embed.set_footer(text=f"Produit {self.index + 1} / {len(self.produits)}")
-        await self.message.edit(embed=embed, view=self)
-
-    @discord.ui.button(label="Précédent", style=discord.ButtonStyle.secondary)
-    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.index > 0:
-            self.index -= 1
-            await self.update_message()
-        await interaction.response.defer()
-
-    @discord.ui.button(label="Acheter", style=discord.ButtonStyle.success)
-    async def acheter(self, interaction: discord.Interaction, button: discord.ui.Button):
-        produit = self.produits[self.index]
-        if produit["stock"] <= 0:
-            await interaction.response.send_message("Désolé, ce produit est en rupture de stock.", ephemeral=True)
-            return
-        # Crée la commande
-        database.add_command(interaction.user.id, produit["name"])
-
-        # Met à jour le stock
-        produit["stock"] -= 1
-        db = database.load_db()
-        for p in db["products"]:
-            if p["name"].lower() == produit["name"].lower():
-                p["stock"] = produit["stock"]
-                break
-        database.save_db(db)
-
-        # Envoie un message dans le salon commandes
-        global commandes_channel
-        if commandes_channel:
-            await commandes_channel.send(f"Nouvelle commande de {interaction.user.mention} pour **{produit['name']}**.")
-
-        await interaction.response.send_message("Commande enregistrée ! Merci pour votre achat.", ephemeral=True)
-        await self.update_message()
-
-    @discord.ui.button(label="Suivant", style=discord.ButtonStyle.secondary)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.index < len(self.produits) - 1:
-            self.index += 1
-            await self.update_message()
-        await interaction.response.defer()
-
-@TREE.command(name="boutique", description="Afficher la boutique")
-async def boutique(interaction: discord.Interaction):
-    produits = database.get_all_products()
-    if not produits:
-        await interaction.response.send_message("La boutique est vide.", ephemeral=True)
+# /logs - voir logs
+@bot.tree.command(name="logs", description="Voir les logs (admin)")
+async def logs(interaction: Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message("Tu n'as pas la permission.", ephemeral=True)
         return
-    view = BoutiqueView(produits)
-    embed = discord.Embed(title=f"🛍️ Boutique - {produits[0]['name']}", color=0x3498db)
-    embed.add_field(name="Description", value=produits[0]["description"], inline=False)
-    embed.add_field(name="Prix", value=f"{produits[0]['price']} €", inline=True)
-    embed.add_field(name="Stock", value=str(produits[0]["stock"]), inline=True)
-    embed.set_footer(text=f"Produit 1 / {len(produits)}")
-    msg = await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
-    view.message = await interaction.original_response()
+    if not db["logs"]:
+        await interaction.response.send_message("Pas de logs disponibles.", ephemeral=True)
+        return
+    await interaction.response.send_message("\n".join(db["logs"][-10:]), ephemeral=True)
 
-# --- Ajouter un produit (admin) ---
+# Ajoute un log simple dans la DB (exemple)
+def add_log(entry: str):
+    db["logs"].append(entry)
+    if len(db["logs"]) > 100:
+        db["logs"].pop(0)
+    save_db(db)
 
-class AddProduitModal(discord.ui.Modal, title="Ajouter un produit"):
-    def __init__(self):
-        super().__init__()
-        self.nom = discord.ui.TextInput(label="Nom du produit", max_length=50)
-        self.description = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph)
-        self.stock = discord.ui.TextInput(label="Stock", max_length=5)
-        self.prix = discord.ui.TextInput(label="Prix (€)", max_length=10)
-
-        self.add_item(self.nom)
-        self.add_item(self.description)
-        self.add_item(self.stock)
-        self.add_item(self.prix)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            stock = int(self.stock.value)
-            prix = float(self.prix.value)
-        except:
-            await interaction.response.send_message("Stock doit être un entier et prix un nombre.", ephemeral=True)
-            return
-        database.add_product(self.nom.value, self.description.value, stock, prix)
-        await interaction.response.send_message(f"Produit **{self.nom.value}** ajouté à la boutique.", ephemeral=True)
-
-@TREE.command(name="addproduits", description="Ajouter un produit à la boutique (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def addproduits(interaction: discord.Interaction):
-    modal = AddProduitModal()
-    await interaction.response.send_modal(modal)
-
-# --- Supprimer un produit (admin) ---
-
-@TREE.command(name="suprproduits", description="Supprimer un produit (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def suprproduits(interaction: discord.Interaction, nom: str):
-    ok = database.remove_product(nom)
-    if ok:
-        await interaction.response.send_message(f"Produit **{nom}** supprimé.")
-    else:
-        await interaction.response.send_message("Produit introuvable.")
-
-# --- Supprimer un pack (admin) ---
-
-@TREE.command(name="suprpack", description="Supprimer un pack (admin)")
-@app_commands.checks.has_permissions(administrator=True)
-async def suprpack_cmd(interaction: discord.Interaction, nom: str):
-    ok = database.remove_pack(nom)
-    if ok:
-        await interaction.response.send_message(f"Pack **{nom}** supprimé.")
-    else:
-        await interaction.response.send_message("Pack introuvable.")
-
-# --- Erreurs ---
-
-@addproduits.error
-@suprproduits.error
-@suprpack_cmd.error
-@cmdencours.error
-@cmdlivrer.error
-@suprcmd.error
-@addcmd.error
-@clear.error
-@ban.error
-@kick.error
-async def on_command_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message("Vous n'avez pas la permission d'utiliser cette commande.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Erreur: {error}", ephemeral=True)
-
+# --- Run Bot ---
 bot.run(TOKEN)
