@@ -21,16 +21,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 TREE = bot.tree
 
 # Chargement de la base de données
-if not os.path.exists("database.json"):
-    with open("database.json", "w") as f:
-        json.dump({"commands": [], "products": [], "packs": [], "subscriptions": {}}, f)
-
-with open("database.json", "r") as f:
-    db = json.load(f)
-
-def save_db():
-    with open("database.json", "w") as f:
-        json.dump(db, f, indent=4)
+database.init_db()  # crée la db si elle n'existe pas
+db = database.load_db()  # charge la db
 
 # ========== COMMANDES SLASH ==========
 
