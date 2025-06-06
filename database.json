@@ -1,80 +1,81 @@
 import json
 import os
-from datetime import datetime, timedelta
 
-DB_PATH = "database.json"
+DB_FILE = "database.json"
 
-def init_db():
-    if not os.path.exists(DB_PATH):
-        with open(DB_PATH, "w") as f:
-            json.dump({"commands": [], "products": [], "packs": [], "subscriptions": {}}, f, indent=4)
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, "w") as f:
+        json.dump({"commands": [], "products": [], "packs": [], "subscriptions": {}}, f)
 
 def load_db():
-    with open(DB_PATH, "r") as f:
+    with open(DB_FILE, "r") as f:
         return json.load(f)
 
 def save_db(db):
-    with open(DB_PATH, "w") as f:
+    with open(DB_FILE, "w") as f:
         json.dump(db, f, indent=4)
 
-# Fonctions commandes
-def get_commands(db, user_id=None, status_filter=None):
-    cmds = db["commands"]
-    if user_id is not None:
-        cmds = [c for c in cmds if c["user"] == user_id]
-    if status_filter is not None:
-        cmds = [c for c in cmds if c["status"] != status_filter]
-    return cmds
+def get_all_commands():
+    db = load_db()
+    return db["commands"]
 
-def add_command(db, user_id, product, status="en attente"):
-    db["commands"].append({"user": user_id, "product": product, "status": status})
+def add_command(user_id, product_name):
+    db = load_db()
+    db["commands"].append({"user": user_id, "product": product_name, "status": "en attente"})
     save_db(db)
 
-def update_command_status(db, user_id, product, new_status):
-    for cmd in db["commands"]:
-        if cmd["user"] == user_id and cmd["product"].lower() == product.lower():
-            cmd["status"] = new_status
+def remove_command(user_id, product_name):
+    db = load_db()
+    db["commands"] = [c for c in db["commands"] if not (c["user"] == user_id and c["product"].lower() == product_name.lower())]
+    save_db(db)
+
+def update_command_status(user_id, product_name, status):
+    db = load_db()
+    for c in db["commands"]:
+        if c["user"] == user_id and c["product"].lower() == product_name.lower():
+            c["status"] = status
             save_db(db)
             return True
     return False
 
-def remove_command(db, user_id, product):
-    before = len(db["commands"])
-    db["commands"] = [c for c in db["commands"] if not (c["user"] == user_id and c["product"].lower() == product.lower())]
-    save_db(db)
-    return len(db["commands"]) < before
+def get_commands_by_user(user_id):
+    db = load_db()
+    return [c for c in db["commands"] if c["user"] == user_id]
 
-# Produits
-def get_product_price(db, product_name):
+def get_commands_not_livree():
+    db = load_db()
+    return [c for c in db["commands"] if c["status"] != "livrée"]
+
+def get_all_products():
+    db = load_db()
+    return db["products"]
+
+def add_product(name, description, stock, price):
+    db = load_db()
+    db["products"].append({"name": name, "description": description, "stock": stock, "price": price})
+    save_db(db)
+
+def remove_product(name):
+    db = load_db()
+    before = len(db["products"])
+    db["products"] = [p for p in db["products"] if p["name"].lower() != name.lower()]
+    save_db(db)
+    return len(db["products"]) < before
+
+def get_product(name):
+    db = load_db()
     for p in db["products"]:
-        if p["name"].lower() == product_name.lower():
-            return p["price"]
+        if p["name"].lower() == name.lower():
+            return p
     return None
 
-def add_product(db, name, price):
-    db["products"].append({"name": name, "price": price})
-    save_db(db)
-
-# Packs
-def get_packs(db):
+def get_all_packs():
+    db = load_db()
     return db["packs"]
 
-def add_pack(db, name, price, description):
-    db["packs"].append({"name": name, "price": price, "description": description})
+def remove_pack(name):
+    db = load_db()
+    before = len(db["packs"])
+    db["packs"] = [p for p in db["packs"] if p["name"].lower() != name.lower()]
     save_db(db)
-
-# Abonnements
-def get_subscription(db, user_id):
-    return db["subscriptions"].get(str(user_id))
-
-def add_subscription(db, user_id, abo_type, days_duration):
-    end_date = (datetime.utcnow() + timedelta(days=days_duration)).strftime("%Y-%m-%d")
-    db["subscriptions"][str(user_id)] = {"type": abo_type, "end": end_date}
-    save_db(db)
-
-def remove_subscription(db, user_id):
-    if str(user_id) in db["subscriptions"]:
-        del db["subscriptions"][str(user_id)]
-        save_db(db)
-        return True
-    return False
+    return len(db["packs"]) < before
